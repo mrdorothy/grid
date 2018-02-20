@@ -1,0 +1,6 @@
+// DB Helpers
+
+psql -h nem-data.cclyf5gm9q8m.us-west-2.rds.amazonaws.com -U [username] -p 5432 -d nem_data 
+password: [password]
+
+How to see all current tables: \dt *.*

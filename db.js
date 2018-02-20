@@ -7,7 +7,7 @@ dotenv.load();
 const database_object = {
     host: 'nem-data.cclyf5gm9q8m.us-west-2.rds.amazonaws.com',
     port: 5432,
-    database: 'nem-data',
+    database: 'nem_data',
     user: process.env.db_user,
     password: process.env.db_password
 };

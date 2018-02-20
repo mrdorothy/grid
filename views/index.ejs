@@ -1,11 +1,33 @@
 <!DOCTYPE html>
 <html>
-  <head>
-    <title><%= title %></title>
-    <link rel='stylesheet' href='/stylesheets/style.css' />
-  </head>
-  <body>
-    <h1><%= title %></h1>
-    <p>Welcome to <%= title %></p>
-  </body>
+
+<head>
+    <% include head.ejs %>
+        <title>
+            <%= title %>
+        </title>
+</head>
+
+<body>
+	<section class="section">
+	    <div class="container">
+	        <h1 class="title">
+	        	<%= title %>
+	      	</h1>
+	        <p class="subtitle">
+	            Welcome to <strong><%= title %></strong>.
+	        </p>
+	        <div class="control">
+			    <button class="button is-info" id='js-test_code'>Run Test Code</button>
+			</div>
+			<section class='section'>
+				<p class="container" id='js-test_code_output'>
+	        	</p>
+	    	</section>
+	    </div>
+	</section>
+</body>
+
+<script src="/javascripts/front_scripts.js"></script>
+
 </html>
