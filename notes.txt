@@ -4,3 +4,313 @@ psql -h nem-data.cclyf5gm9q8m.us-west-2.rds.amazonaws.com -U [username] -p 5432 
 password: [password]
 
 How to see all current tables: \dt *.*
+
+How to sum by timestamp: SELECT timestamp, sum(output) as output FROM generation WHERE timestamp>'2017-04-03' GROUP BY timestamp ORDER BY timestamp;
+
+Get unique timestamps: SELECT DISTINCT timestamp FROM generation ORDER BY timestamp;
+
+Get points grouped by day: SELECT datestamp, COUNT(datestamp) as num_data_points FROM (SELECT DATE(timestamp) as datestamp FROM generation) as foo GROUP BY datestamp ORDER BY datestamp;
+
+Get files grouped by day: SELECT datestamp, COUNT(datestamp) as num_data_points FROM (SELECT DATE(timestamp) as datestamp FROM (SELECT DISTINCT timestamp FROM generation) as baa) as foo GROUP BY datestamp ORDER BY datestamp;
+
+Get files grouped by day (old table): SELECT datestamp, COUNT(datestamp) as num_data_points FROM (SELECT DATE(date_time) as datestamp FROM (SELECT DISTINCT date_time FROM output) as baa) as foo GROUP BY datestamp ORDER BY datestamp;
+
+Copy from old table: INSERT INTO generation (timestamp, id, output) SELECT date_time, plant, output FROM output WHERE Date(date_time)>'2016-12-31';
+
+Get 'missed' files: SELECT timestamp, output FROM (SELECT timestamp, sum(output) as output FROM generation GROUP BY timestamp) as foo WHERE output<12000 ORDER BY timestamp;
+
+// Tables
+
+	CREATE TABLE generation(
+		timestamp TIMESTAMP,
+		id VARCHAR(50),
+		output REAL,
+		PRIMARY KEY( timestamp, id )
+	);
+
+// Plans
+
+	// Bookie
+
+	generic functions:
+
+		- delete everything from the staging folder
+			- make sure no one else is using the folder, then delete everything in it.
+		- dots and counting
+
+// Spare Code
+
+// Collect old files we missed from nemWEB
+
+back_filler = () => {
+
+    // Initial set up
+
+    console.time(`-> time`)
+    var url = `http://www.nemweb.com.au/REPORTS/ARCHIVE/Dispatch_SCADA/`
+    var minutes_between_runs = 1440
+    var start_time = moment()
+    var max_days = 10 // Temp max number of days for testing smaller batches
+    console.log(`\n------------------------------------------------------------------------------------\n`)
+    log(`|| ${start_time.format(`DD MMM YY HH:mm:ss`)} | Commencing the back fill of missed files ||\n`, `i`)
+    checkpoint()
+    log(`Collecting previous list of existing dates...`, `i`)
+
+    // Query for existing dates for which we have data 
+
+    db.multi(`  SELECT 
+                    datestamp, COUNT(datestamp) as num_data_points 
+                FROM 
+                    (SELECT 
+                        DATE(timestamp) as datestamp 
+                    FROM 
+                        (SELECT DISTINCT 
+                            timestamp 
+                        FROM 
+                            generation) as baa) as foo 
+                GROUP BY 
+                    datestamp 
+                ORDER BY 
+                    datestamp;
+                SELECT 
+                    COUNT(timestamp) as previous_data_count
+                FROM
+                    generation;`)
+        .then(data_days => {
+
+            log(`1. Collected previous list of previous days |\n`, `s`)
+            checkpoint()
+            log(`Checking nemweb.com.au/REPORTS/ARCHIVE/Dispatch_SCADA/ for archived files...`, `i`)
+
+            // Get list of archived dates available to download
+
+            requester(url, (err, resp, body) => {
+
+                $ = cheerio.load(body)
+                var links = $(`a`)
+                var required_days = []
+
+                $(links).each((i, link) => {
+                    var link_string = $(link).attr(`href`)
+                    if (link_string.indexOf(`PUBLIC_DISPATCHSCADA_`) != -1) {
+                        var link_timestamp = link_string.substring(link_string.indexOf(`PUBLIC_DISPATCHSCADA_`) + 21, link_string.indexOf(`PUBLIC_DISPATCHSCADA_`) + 8 + 21)
+                        var need_to_download = true
+                        for (var data_day of data_days[0]) {
+                            if (moment(data_day.datestamp).format(`YYYYMMDD`) == link_timestamp && data_day.num_data_points == 288) {
+                                need_to_download = false
+                            }
+                        }
+                        if (need_to_download == true && required_days.length < max_days) {
+                            required_days.push(link_string)
+                        }
+                    }
+                })
+
+                log(`2. Collected the list of required files |\n`, `s`)
+                checkpoint()
+
+                if (required_days.length > 0) {
+
+                    log(`There are ${required_days.length} of data to back fill.`, `i`)
+                    log(`Begining now...\n`, `i`)
+
+                    process.stdout.write(`0 of ${required_days.length} day's data back filled`)
+                    batch_archive(0, required_days, () => {
+                        for (punch = 0; punch < 20; punch++) {
+                            process.stdout.write(` !`)
+                        }
+                        process.stdout.write(`\n\n`)
+                        db.query(`SELECT 
+                                    COUNT(timestamp) as current_data_count
+                                FROM
+                                    generation;`)
+                            .then(data_count => {
+
+                                log(`3. Downloaded and back filled ${required_days.length} day's of data |\n`, `s`)
+                                checkpoint()
+                                console.log(``)
+                                log(`|| ${start_time.format(`DD MMM YY HH:mm:SS`)} | Data extraction complete for ${required_days.length} days in ${convert_ms(moment().diff(start_time))} ||\n`, `i`)
+                                log(`DB stats -----> PREVIOUS NUMBER OF DATA POINTS: $1`, `i`, [data_days[1][0].previous_data_count])
+                                log(`DB stats -----> CURRENT NUMBER OF DATA POINTS:  $1`, `i`, [data_count[0].current_data_count])
+                                log(`DB stats -----> ACTUAL ADDED:                   $1`, `i`, [data_count[0].current_data_count - data_days[1][0].previous_data_count])
+                                log(`See you tomorrow\n`, `i`)
+                                console.log(`------------------------------------------------------------------------------------`)
+
+                            })
+                            .catch(err => {
+                                log(`---> There was some issue querying the generation DB | Might want to look into this. |`, `e`)
+                                console.log(err);
+                                log(`|| There was some issue querying the generation DB. Process exiting at ${start_time.format(`DD MMM YY HH:mm:ss`)} Total time taken was ${convert_ms(moment().diff(start_time))} ||\n`, `e`)
+                                log(`See you tomorrow\n`, `i`)
+                                console.log(`------------------------------------------------------------------------------------`)
+                            });
+
+                    })
+                } else {
+                    log(`|| There are no files required to be backfilled. Process exiting at ${start_time.format(`DD MMM YY HH:mm:ss`)}. Total time taken was ${convert_ms(moment().diff(start_time))} ||\n`, `i`)
+                    log(`See you in tomorrow\n`, `i`)
+                    console.log(`------------------------------------------------------------------------------------`)
+                }
+            })
+        })
+        .catch(err => {
+            log(`---> There was some issue querying the generation DB | Might want to look into this. |`, `e`)
+            console.log(err);
+            log(`|| There was some issue querying the generation DB. Process exiting at ${start_time.format(`DD MMM YY HH:mm:ss`)} Total time taken was ${convert_ms(moment().diff(start_time))} ||\n`, `e`)
+            log(`See you tomorrow\n`, `i`)
+            console.log(`------------------------------------------------------------------------------------`)
+        });
+}
+
+// Iterative function for batching backfile runs
+
+batch_archive = (current_day, file_array, call_back) => {
+
+    // Check if we have done all the files then end the interations
+
+    if (current_day >= file_array.length) {
+        call_back()
+    } else {
+
+        var day_source_link = `http://www.nemweb.com.au${file_array[current_day]}`
+        var day_file_name = file_array[current_day].substring(file_array[current_day].indexOf(`PUBLIC_DISPATCHSCADA_`), file_array[current_day].length)
+        var day_destination_file = `./file_staging/${day_file_name}`
+        var day_timestamp = file_array[current_day].substring(file_array[current_day].indexOf(`PUBLIC_DISPATCHSCADA_`) + 21, file_array[current_day].indexOf(`PUBLIC_DISPATCHSCADA_`) + 8 + 21)
+        var file_check_attempts = 10
+        var upload_data = []
+        var column_headings = [`i`, `d`, `u`, `n`, `timestamp`, `id`, `output`];
+
+        download(day_source_link, day_destination_file, () => { // Download the file
+            if (!fs.existsSync(`./file_staging/${day_timestamp}`)) {
+                fs.mkdirSync(`./file_staging/${day_timestamp}`);
+            }
+            unzipper.Open.file(day_destination_file)
+                .then(list_of_files => {
+                    var temp_output_files = []
+                    for (var output_files of list_of_files.files) {
+                        temp_output_files.push({
+                            zip: output_files.path,
+                            csv: `${output_files.path.slice(0, output_files.path.length - 4)}.csv`
+                        })
+                    }
+                    fs.createReadStream(day_destination_file).pipe(unzipper.Extract({ path: `./file_staging/${day_timestamp}` })).on('close', () => { // Unzip the file
+                        var total_extracted = 0
+                        async.map(temp_output_files, (file, file_complete) => {
+                            wait_for_file(`./file_staging/${day_timestamp}/${file.zip}`, () => {
+                                fs.createReadStream(`./file_staging/${day_timestamp}/${file.zip}`).pipe(unzipper.Extract({ path: `./file_staging/${day_timestamp}/` })).on(`close`, () => {
+                                    wait_for_file(`./file_staging/${day_timestamp}/${file.csv}`, () => {
+                                        fs.unlink(`./file_staging/${day_timestamp}/${file.zip}`, () => {
+                                            file_complete(null)
+                                        })
+                                    }, () => {
+                                        log(`---> Attempted to find ./file_staging/${day_timestamp}/${file.csv} ${file_check_attempts} times without any luck! 
+                                        Might want to look into this. |`, `e`)
+                                        file_complete(null)
+                                    }, 1, file_check_attempts, 100)
+                                })
+                            }, () => {
+                                log(`---> Attempted to find ./file_staging/${day_timestamp}/${file.zip} ${file_check_attempts} times without any luck! 
+                                Might want to look into this. |`, `e`)
+                                file_complete(null)
+                            }, 1, file_check_attempts, 100)
+                        }, () => {
+                            fs.unlink(day_destination_file, () => {
+
+                                db.query(`SELECT DISTINCT
+                                        timestamp
+                                    FROM
+                                        generation
+                                    WHERE
+                                        DATE(timestamp)='${moment(day_timestamp,'YYYYMMDD').format('YYYY/MM/DD')}';`)
+                                    .then(timestamps => {
+                                        async.map(temp_output_files, (csvs, csv_complete) => {
+                                            var csv_timestamp = csvs.csv.substring(csvs.csv.indexOf(`PUBLIC_DISPATCHSCADA_`) + 21, csvs.csv.indexOf(`PUBLIC_DISPATCHSCADA_`) + 12 + 21)
+                                            var already_collected = false
+                                            for (time_stamp_point of timestamps) {
+                                                if (time_stamp_point == csv_timestamp) {
+                                                    already_collected = true
+                                                    break
+                                                }
+                                            }
+                                            if (already_collected == false) {
+                                                csv({ file: `./file_staging/${day_timestamp}/${csvs.csv}`, columns: column_headings }, (err, array) => {
+                                                    if (err) {
+                                                        console.log(err)
+                                                        csv_complete(null)
+                                                    } else {
+                                                        var temp_data_array = []
+                                                        array.forEach(point => {
+                                                            if (point.i == `D` && point.output != 0) {
+                                                                var already_exists = false
+                                                                for (var row_1 = 0; row_1 < temp_data_array.length; row_1++) {
+                                                                    if (temp_data_array[row_1].timestamp == point.timestamp && temp_data_array[row_1].id == point.id) {
+                                                                        log(point.timestamp + ' ' + point.id + ' ' + point.output)
+                                                                        already_exists = true
+                                                                    }
+                                                                }
+                                                                if (already_exists == false) {
+                                                                    temp_data_array.push({
+                                                                        timestamp: point.timestamp,
+                                                                        id: point.id,
+                                                                        output: point.output
+                                                                    })
+                                                                    upload_data.push({
+                                                                        timestamp: point.timestamp,
+                                                                        id: point.id,
+                                                                        output: point.output
+                                                                    })
+                                                                }
+                                                            }
+                                                        })
+                                                        fs.unlink(`./file_staging/${day_timestamp}/${csvs.csv}`, () => {
+                                                            csv_complete(null)
+                                                        })
+                                                    }
+                                                })
+                                            } else {
+                                                fs.unlink(`./file_staging/${day_timestamp}/${csvs.csv}`, () => {
+                                                    csv_complete(null)
+                                                })
+                                            }
+                                        }, () => {
+
+                                            var insert_query = pgp.helpers.insert(upload_data, [`timestamp`, `id`, `output`], 'generation')
+
+                                            // Upload data to the database
+
+                                            db.query(`${insert_query} ON CONFLICT DO NOTHING;`)
+                                                .then(() => {
+                                                    fs.rmdir(`./file_staging/${day_timestamp}/`, () => {
+                                                        process.stdout.clearLine()
+                                                        process.stdout.cursorTo(0)
+                                                        process.stdout.write(`${current_day+1} of ${file_array.length} day's data back filled`)
+                                                        batch_archive(current_day + 1, file_array, call_back)
+                                                    })
+                                                })
+                                                .catch(err => {
+                                                    log(`---> There was some issue querying the generation DB | Might want to look into this. |`, `e`)
+                                                    console.log(err);
+                                                    log(`Failed to process ${day_file_name}\n`, `e`)
+                                                    batch_archive(current_day + 1, file_array, call_back)
+                                                });
+                                        })
+                                    })
+                                    .catch(err => {
+                                        log(`---> There was some issue querying the generation DB | Might want to look into this. |`, `e`)
+                                        console.log(err);
+                                        log(`Failed to process ${day_file_name}\n`, `e`)
+                                        batch_archive(current_day + 1, file_array, call_back)
+                                    });
+                            })
+                        })
+                    })
+                });
+        }, () => {
+            log(`There was some error downloading ${file_array[current_day]}`, `e`)
+            batch_archive(current_day + 1, file_array, call_back)
+        })
+    }
+}
+
+
+
