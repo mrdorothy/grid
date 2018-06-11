@@ -6,7 +6,7 @@ var log = require(`../helpers/log.js`)
 var requester = require(`request`)
 var cheerio = require(`cheerio`)
 var unzipper = require(`unzipper`)
-var csv = require(`csv-to-array`)
+var csv = require(`csvtojson`)
 var db = require(`../db.js`);
 var async = require(`async`)
 var moment = require(`moment`)
@@ -17,24 +17,26 @@ var pgp = require('pg-promise')();
 const check_point = `--------> time taken since last checkpoint`
 const staging = `./file_staging/`
 const file_check_attempts = 10
+const scada_keyword = `PUBLIC_DISPATCHSCADA_`
+
+const maximum_files_for_testing = 3
 
 // Kick off
 
 exports.kickoff = () => {
-    book_keeping()
+    book_keeping_archive_generation()
 }
 
 // Collect current files from nemweb
 
-book_keeping = () => {
+book_keeping_current_generation = () => {
 
     // Initial set up
 
-    var start_time = process_begin(`book keeping`)
-    var maximum_files_for_testing = 5000
+    var start_time = process_begin(`current book keeping`)
     var url = `http://www.nemweb.com.au/REPORTS/CURRENT/Dispatch_SCADA/`
-    var key_word = `PUBLIC_DISPATCHSCADA_`
     var minutes_between_runs = 5
+    var temp_sub_staging = ``
 
     // In parallel collect stats, get links, get current timestamps
 
@@ -47,7 +49,7 @@ book_keeping = () => {
             })
         },
         links: call_back => {
-            get_links(url, key_word, links => {
+            get_links(url, scada_keyword, links => {
                 call_back(null, links)
             })
         },
@@ -66,9 +68,15 @@ book_keeping = () => {
                     console.log(err)
                     call_back(null, `error`)
                 })
+        },
+        create_sub_staging: call_back => {
+            create_temp_staging(1, (sub_stage_name) => {
+                temp_sub_staging = sub_stage_name
+                call_back(null, sub_stage_name)
+            })
         }
     }, (err, results) => {
-        if (results.previous_stats == `error` || results.links == `error` || results.current_timestamps == `error`) {
+        if (results.previous_stats == `error` || results.links == `error` || results.current_timestamps == `error` || results.create_sub_staging == `error`) {
             log(`There was a fatal error in the collection process`)
         } else {
 
@@ -94,8 +102,7 @@ book_keeping = () => {
             checkpoint(`cross checked available files against current database`)
 
             // Download all the files
-
-            download_array(required_files, () => {
+            download_array(required_files, temp_sub_staging, () => {
 
                 checkpoint(`${required_files.length} files downloaded`)
 
@@ -109,10 +116,10 @@ book_keeping = () => {
                     csvs_to_upload.push(short_file_name.substring(0, short_file_name.length - 3) + `csv`)
                 }
 
-                unzip_array(zips_to_extract, () => {
+                unzip_array(zips_to_extract, temp_sub_staging, () => {
 
                     async.map(csvs_to_upload, (csv_file, unzip_complete) => {
-                        wait_for_file(csv_file, () => {
+                        wait_for_file(csv_file, temp_sub_staging, () => {
                             unzip_complete(null)
                         }, () => {
                             log(`Attempted to find ${csv_file} ${file_check_attempts} times without any luck! Might want to look into this.`, `e`)
@@ -124,25 +131,30 @@ book_keeping = () => {
 
                         // Parse to an array
 
-                        parse_generation_data(csvs_to_upload, (upload_array) => {
+                        parse_generation_data(csvs_to_upload, temp_sub_staging, (upload_array) => {
 
-                            var insert_query = pgp.helpers.insert(upload_array, [`timestamp`, `id`, `output`], 'generation')
+                            if (upload_array.length > 0) {
+                                var insert_query = pgp.helpers.insert(upload_array, [`timestamp`, `id`, `output`], 'generation')
+                            }
 
                             async.parallel({
                                 upload_data: call_back => {
-                                    db.query(`${insert_query};`)
-                                        .then(() => {
-                                            call_back(null, 'success')
-                                        })
-                                        .catch( err => {
-                                            log(`There was some issue querying the generation db whilst uploading the data.`, `e`)
-                                            console.log(err)
-                                            call_back(null, `error`)
-                                        })
+                                    if (upload_array.length > 0) {
+                                        db.query(`${insert_query};`)
+                                            .then(() => {
+                                                call_back(null, 'success')
+                                            })
+                                            .catch(err => {
+                                                log(`There was some issue querying the generation db whilst uploading the data.`, `e`)
+                                                console.log(err)
+                                                call_back(null, `error`)
+                                            })
+                                    } else {
+                                        call_back(null, 'success')
+                                    }
                                 },
                                 tidy_up_staging: call_back => {
-                                    get_links(url, key_word, links => {
-                                        // Need to add delete function here
+                                    purge_sub_staging(temp_sub_staging, () => {
                                         call_back(null, 'success')
                                     })
                                 }
@@ -159,7 +171,7 @@ book_keeping = () => {
                                     log(`DB stats -----> CURRENT DISPATCH INTERVALS:     $1`, `i`, [current_number_of_points.total_unique_points])
                                     process_end('book_keeping', start_time)
 
-                                    log(`See you in ${minutes_between_runs} minutes`,'i')
+                                    log(`See you in ${minutes_between_runs} minutes`, 'i')
 
                                     // Now sleep for 5 minutes
 
@@ -177,253 +189,180 @@ book_keeping = () => {
     })
 }
 
-/*// Initial set up
+// Collect archive files from nemweb
 
-console.time(`-> time`)
-var url = `http://www.nemweb.com.au/REPORTS/CURRENT/Dispatch_SCADA/`
-var minutes_between_runs = 5
-var collect_data = []
-var required_files = []
-var start_time = moment()
-var max_run_index = 5000 // Temp max files testing smaller batches
-console.log(`\n------------------------------------------------------------------------------------\n`)
-log(`|| ${start_time.format(`DD MMM YY HH:mm:ss`)} | Commencing current generation data extraction ||\n`, `i`)
-checkpoint()
-log(`Collecting previous list of timestamps...`, `i`)
+book_keeping_archive_generation = () => {
 
-// Query for existing timestamps 
+    // Initial set up
 
-db.multi(`SELECT DISTINCT 
-                timestamp 
-            FROM
-                generation;
-            SELECT 
-                COUNT(timestamp) as previous_data_count
-            FROM
-                generation;`)
-    .then(timestamps => {
-        log(`1. Collected previous list of timestamps |\n`, `s`)
-        checkpoint()
-        log(`Checking nemweb.com.au/REPORTS/CURRENT/Dispatch_SCADA/ for currently available files...`, `i`)
+    var start_time = process_begin(`archive book keeping`)
+    var url = `http://www.nemweb.com.au/REPORTS/ARCHIVE/Dispatch_SCADA/`
+    var temp_sub_staging = ``
 
-        // Get list of files to download
+    // In parallel collect stats, get links, get current timestamps and how many dispatch windows we have
 
-        requester(url, (err, resp, body) => {
+    async.parallel({
+        links: call_back => {
+            get_links(url, scada_keyword, links => {
+                call_back(null, links)
+            })
+        },
+        archive_timestamps: call_back => {
+            timestamp_query = `
+                SELECT 
+                    datestamp, COUNT(datestamp) as num_data_points 
+                FROM 
+                    (SELECT 
+                        DATE(timestamp) as datestamp 
+                    FROM 
+                        (SELECT 
+                            DISTINCT timestamp 
+                        FROM 
+                            generation
+                        ) as baa
+                    ) as foo 
+                GROUP BY 
+                    datestamp 
+                ORDER BY 
+                    datestamp;`
+            db.query(timestamp_query)
+                .then(timestamps => {
+                    call_back(null, timestamps)
+                })
+                .catch(err => {
+                    log(`There was some issue querying the generation db whilst getting the current timestamps.`, `e`)
+                    console.log(err)
+                    call_back(null, `error`)
+                })
+        },
+        unique_timestamps: call_back => {
+            timestamp_query = `
+                SELECT DISTINCT 
+                    timestamp 
+                FROM
+                    generation;`
+            db.query(timestamp_query)
+                .then(unique_timestamps => {
+                    call_back(null, unique_timestamps)
+                })
+                .catch(err => {
+                    log(`There was some issue querying the generation db whilst getting the current unique timestamps.`, `e`)
+                    console.log(err)
+                    call_back(null, `error`)
+                })
+        },
+        create_sub_staging: call_back => {
+            create_temp_staging(1, (sub_stage_name) => {
+                temp_sub_staging = sub_stage_name
+                call_back(null, sub_stage_name)
+            })
+        }
+    }, (err, results) => {
+        if (results.links == `error` || results.archive_timestamps == `error` || results.unique_timestamps == `error` || results.create_sub_staging == `error`) {
+            log(`There was a fatal error in the collection process`)
+        } else {
 
-            $ = cheerio.load(body)
-            var links = $(`a`)
-            var total_checked = 0
+            checkpoint(`completed initial queries`)
 
-            $(links).each((i, link) => {
-                var link_string = $(link).attr(`href`)
-                if (link_string.indexOf(`PUBLIC_DISPATCHSCADA_`) != -1) {
-                    total_checked += 1
-                    var link_timestamp = link_string.substring(link_string.indexOf(`PUBLIC_DISPATCHSCADA_`) + 21, link_string.indexOf(`PUBLIC_DISPATCHSCADA_`) + 12 + 21)
-                    var already_found = false
-                    for (var timestamp of timestamps[0]) {
-                        if (moment(timestamp.timestamp).format(`YYYYMMDDHHmm`) == link_timestamp) {
-                            already_found = true
-                            break
-                        }
-                    }
-                    if (already_found == false) {
-                        var file_name = link_string.substring(link_string.indexOf(`PUBLIC_DISPATCHSCADA_`), link_string.length)
-                        var output_file = `./file_staging/${file_name}`
-                        required_files.push({
-                            link: link_string,
-                            file_name: file_name,
-                            output_file: output_file,
-                            output_csv: `${output_file.slice(0, output_file.length - 4)}.csv`,
-                            timestamp: link_timestamp
-                        })
+            // For archive files just check the dates vs. the filenames to see which ones we want.
+
+            var required_files = []
+            for (file of results.links) {
+                var file_timestamp = file.substring(file.indexOf(`PUBLIC_DISPATCHSCADA_`) + 21, file.indexOf(`PUBLIC_DISPATCHSCADA_`) + 8 + 21)
+                var already_collected = false
+                for (var check_timestamp of results.archive_timestamps) {
+                    if (moment(check_timestamp.timestamp).format(`YYYYMMDD`) == file_timestamp && check_timestamp.num_data_points > 287) {
+                        already_collected = true
+                        break
                     }
                 }
-            })
-
-            log(`2. Collected list of available files from NEMweb nemweb.com.au/REPORTS/CURRENT/Dispatch_SCADA/ |\n`, `s`)
-            checkpoint()
-            log(`${total_checked} files available, there are only ${required_files.length} which we don't have...`, `i`)
-            log(`Downloading from nemweb.com.au/REPORTS/CURRENT/Dispatch_SCADA/ into an INSERT query...\n`, `i`)
-
-            // Download the files, extract them to CSV then store them in a concatenated string for inserting in the DB
-
-            var file_check_attempts = 10
-
-            var column_headings = [`i`, `d`, `u`, `n`, `timestamp`, `id`, `output`];
-            var run_index = 0 // Temp counter for testing smaller batches
-            total_required = required_files.length
-            if (required_files.length > max_run_index) {
-                log(`Max files is set to ${max_run_index}, which is less than the currently available files (${required_files.length}).\n`, `i`)
-                total_required = max_run_index
+                if (!already_collected && required_files.length < maximum_files_for_testing) {
+                    required_files.push(`http://www.nemweb.com.au${file}`)
+                }
             }
 
-            if (required_files.length > 0) {
-                process.stdout.write(`0 of ${total_required} files downloaded and parsed `)
-                var downloaded_files = 0
-                async.map(required_files, (file, file_complete) => {
+            checkpoint(`cross checked available files against current database`)
 
-                    if (run_index < max_run_index) {
-                        run_index += 1
+            // Download all the files
 
-                        download(`http://www.nemweb.com.au${file.link}`, file.output_file, () => { // Download the file
+            download_array(required_files, temp_sub_staging, () => {
 
-                            fs.createReadStream(file.output_file).pipe(unzipper.Extract({ path: `./file_staging/` })).on('close', () => { // Unzip the file
+                checkpoint(`${required_files.length} files downloaded`)
 
-                                wait_for_file(file.output_csv, () => {
-                                    csv({ file: file.output_csv, columns: column_headings }, (err, array) => {
-                                        if (err) {
-                                            console.log(err)
-                                            file_complete(null)
-                                        } else {
-                                            var temp_data_array = []
-                                            array.forEach(point => {
-                                                if (point.i == `D` && point.output != 0) {
-                                                    var already_exists = false
-                                                    for (row_1 = 0; row_1 < temp_data_array.length; row_1++) {
-                                                        if (temp_data_array[row_1].timestamp == point.timestamp && temp_data_array[row_1].id == point.id) {
-                                                            already_exists = true
-                                                        }
-                                                    }
-                                                    if (already_exists == false) {
-                                                        temp_data_array.push({
-                                                            timestamp: point.timestamp,
-                                                            id: point.id,
-                                                            output: point.output
-                                                        })
-                                                        collect_data.push({
-                                                            timestamp: point.timestamp,
-                                                            id: point.id,
-                                                            output: point.output
-                                                        })
+                // Sort out files
 
-                                                    }
-                                                }
-                                            })
-                                            downloaded_files += 1
-                                            process.stdout.clearLine()
-                                            process.stdout.cursorTo(0)
-                                            process.stdout.write(`${downloaded_files} of ${total_required} files downloaded and parsed`)
-                                            file_complete(null)
+                var zips_to_extract = []
+                for (file of required_files) {
+                    var short_file_name = trim_url_to_file(file)
+                    zips_to_extract.push(short_file_name)
+                }
+
+                // We now have a list of all archive days, now we want to extract each to its own sub stage and then in parrallel upload them
+
+                upload_archive_timestamps = []
+
+                async.map(zips_to_extract, (archive_zip, archive_date_complete_analysis) => {
+                    var archive_zip_sub_stage
+                    create_temp_staging(1, (sub_stage_name) => {
+                        archive_zip_sub_stage = sub_stage_name
+                        unzip_single(archive_zip, temp_sub_staging, archive_zip_sub_stage, () => {
+
+                            // Now we need to get an array of dates and timestamps from the db
+
+                            fs.readdir(staging + archive_zip_sub_stage, (err, files) => {
+                                upload_archive_timestamps.push ({ directory: archive_zip_sub_stage, files: [], csvs: [] })
+                                files.forEach(file => {
+                                    var temp_timestamp = file.substring(file.indexOf(`PUBLIC_DISPATCHSCADA_`) + 21, file.indexOf(`PUBLIC_DISPATCHSCADA_`) + 12 + 21)
+                                    var already_collected = false
+                                    for (var check_timestamp of results.unique_timestamps) {
+                                        if (moment(check_timestamp.timestamp).format(`YYYYMMDDHHmm`) == temp_timestamp) {
+                                            already_collected = true
+                                            break
                                         }
-                                    })
-
-                                }, () => {
-
-                                    log(`---> Attempted to find ${file.output_csv} ${file_check_attempts} times without any luck! 
-                                        Might want to look into this. |`, `e`)
-                                    file_complete(null)
-
-                                }, 1, file_check_attempts, 100)
+                                    }
+                                    if (!already_collected) {
+                                        upload_archive_timestamps[upload_archive_timestamps.length-1]['files'].push(file)
+                                        upload_archive_timestamps[upload_archive_timestamps.length-1]['csvs'].push(file.substring(0, file.length - 3) + `csv`)
+                                    }
+                                })
+                                archive_date_complete_analysis(null)
                             })
-                        }, () => {
-                            log(`There was some error downloading ${file.link}`, `e`)
-                            file_complete(null)
                         })
-
-                    } else {
-                        file_complete(null) // If exceeded max file count for testing purposes
-                    }
-
+                    })
                 }, () => {
 
-                    for (punch = 0; punch < 20; punch++) {
-                        process.stdout.write(` !`)
-                    }
-                    process.stdout.write(`\n\n`)
+                    checkpoint(`${upload_archive_timestamps.length} archive files analysed`)
 
-                    // Create the INSERT query
+                    // Now we need to run the very standard unzip all, upload all csvs, purge all
 
-                    var insert_query = pgp.helpers.insert(collect_data, [`timestamp`, `id`, `output`], 'generation')
+                    async.map(upload_archive_timestamps, (archive_date, archive_date_complete) => {
 
-                    log(`3. Downloaded, unzipped and compiled all files into an INSERT query |\n`, `s`)
-                    checkpoint()
-                    log(`Now uploading to the 'generation' DB...`, `i`)
+                        unzip_array(archive_date.files, archive_date.directory, () => {
+                            //parse csvs
 
-                    // Upload data to the database
-
-                    db.multi(`${insert_query} ON CONFLICT DO NOTHING;
-                        SELECT 
-                            COUNT(timestamp) as num_datapoints 
-                        FROM 
-                            generation; 
-                        SELECT 
-                            COUNT(timestamp) as num_data_days 
-                        FROM 
-                            (SELECT DISTINCT 
-                                DATE(timestamp) 
-                            FROM 
-                                generation) as timestamp;`)
-                        .then((return_data) => {
-
-                            log(`4. Data uploaded to the 'generation DB |\n`, `s`)
-                            checkpoint()
-                            log(`Sweeping out the staging area...`, 'i')
-
-                            async.map(required_files, (file, delete_complete) => {
-                                fs.unlink(file.output_file, () => {
-                                    delete_complete(null)
-                                })
-                            }, () => {
-                                async.map(required_files, (file, delete_complete) => {
-                                    fs.unlink(file.output_csv, () => {
-                                        delete_complete(null)
-                                    })
-                                }, () => {
-
-                                    log(`5. .zip & .csv files deleted |\n`, `s`)
-                                    checkpoint()
-                                    console.log(``)
-                                    log(`|| ${start_time.format(`DD MMM YY HH:mm:SS`)} | Data extraction complete for ${total_required} files in ${convert_ms(moment().diff(start_time))} ||\n`, `i`)
-                                    log(`DB stats -----> PREVIOUS NUMBER OF DATA POINTS: $1`, `i`, [timestamps[1][0].previous_data_count])
-                                    log(`DB stats -----> CURRENT NUMBER OF DATA POINTS:  $1`, `i`, [return_data[1][0].num_datapoints])
-                                    log(`DB stats -----> REQUIRED TO BE ADDED:           $1`, `i`, [collect_data.length])
-                                    log(`DB stats -----> ACTUAL ADDED:                   $1`, `i`, [return_data[1][0].num_datapoints - timestamps[1][0].previous_data_count])
-                                    if ((return_data[1][0].num_datapoints - timestamps[1][0].previous_data_count - collect_data.length) != 0) {
-                                        log(`Didn't upload all of the collected data!`, `e`)
-                                    }
-                                    log(`DB stats -----> CURRENT DAYS OF DATA:           $1\n`, `i`, [return_data[2][0].num_data_days])
-                                    log(`See you in 5 minutes\n`, `i`)
-                                    console.log(`------------------------------------------------------------------------------------`)
-
-                                    // Now sleep for 5 minutes
-
-                                    setTimeout(() => {
-                                        book_keeping()
-                                    }, minutes_between_runs * 60000)
-
-                                })
-                            })
+                            archive_date_complete(null)
                         })
-                        .catch(err => {
-                            log(`---> There was some issue uploading data to the 'generation' DB | Might want to look into this. |`, `e`)
-                            console.log(err);
-                            log(`|| There was some issue querying the generation DB. Process exiting at ${start_time.format(`DD MMM YY HH:mm:ss`)}. Total time taken was ${convert_ms(moment().diff(start_time))} ||\n`, `i`)
-                            log(`See you in 5 minutes\n`, `i`)
-                            console.log(`------------------------------------------------------------------------------------`)
-                        })
+
+                    }, () => {
+
+                        log('finished','s')
+
+                    })
                 })
-            } else {
-                log(`---> There were no files to be collected | Might want to look into this. |`, `e`)
-                log(`|| There were no files to be collected. Process exiting at ${start_time.format(`DD MMM YY HH:mm:ss`)}. Total time taken was ${convert_ms(moment().diff(start_time))} ||\n`, `e`)
-                log(`See you in 5 minutes\n`, `i`)
-                console.log(`------------------------------------------------------------------------------------`)
-            }
-        })
+
+
+            })
+
+        }
     })
-    .catch(err => {
-        log(`---> There was some issue querying the generation DB | Might want to look into this. |`, `e`)
-        console.log(err);
-        log(`|| There was some issue querying the generation DB. Process exiting at ${start_time.format(`DD MMM YY HH:mm:ss`)} Total time taken was ${convert_ms(moment().diff(start_time))} ||\n`, `e`)
-        log(`See you in 5 minutes\n`, `i`)
-        console.log(`------------------------------------------------------------------------------------`)
-    });*/
+}
 
 
 // Generic downloading function
 
-download = (address, destination, success_call_back, error_call_back) => {
+download = (address, sub_staging, success_call_back, error_call_back) => {
 
-    var file = fs.createWriteStream(staging + destination)
+    var file = fs.createWriteStream(staging + sub_staging)
 
     var request = http.get(address, response => {
         if (response.statusCode != 400 && response.statusCode != 200) {
@@ -443,14 +382,14 @@ download = (address, destination, success_call_back, error_call_back) => {
 
 // Batch download 
 
-download_array = (required_files, call_back) => {
+download_array = (required_files, sub_staging, call_back) => {
     process.stdout.write(`0 of ${required_files.length} files downloaded...`)
     var downloaded_files = 0
 
     async.map(required_files, (file, download_complete) => {
-        file_name = trim_url_to_file(file)
+        file_name = sub_staging + trim_url_to_file(file)
         download(file, file_name, () => {
-            wait_for_file(file_name, () => {
+            wait_for_file(file_name, sub_staging, () => {
 
                 downloaded_files += 1
                 process.stdout.clearLine()
@@ -476,12 +415,12 @@ download_array = (required_files, call_back) => {
 
 // Batch unzip 
 
-unzip_array = (required_files, call_back) => {
+unzip_array = (required_files, sub_staging, call_back) => {
     process.stdout.write(`0 of ${required_files.length} files unzipped...`)
     var unzipped_files = 0
 
     async.map(required_files, (file, unzip_complete) => {
-        fs.createReadStream(staging + file).pipe(unzipper.Extract({ path: staging })).on('close', () => { // Unzip the file
+        fs.createReadStream(staging + sub_staging + file).pipe(unzipper.Extract({ path: staging + sub_staging })).on('close', () => { // Unzip the file
             unzipped_files += 1
             process.stdout.clearLine()
             process.stdout.cursorTo(0)
@@ -494,52 +433,73 @@ unzip_array = (required_files, call_back) => {
     })
 }
 
+// Single unzip 
+
+unzip_single = (file, sub_staging, destination, call_back) => {
+
+    fs.createReadStream(staging + sub_staging + file).pipe(unzipper.Extract({ path: staging + destination })).on('close', () => { // Unzip the file
+        call_back()
+    })
+
+}
+
+// Test a particular file
+
+test_particular_file = (file_to_test) => {
+
+    var column_headings = [`i`, `d`, `u`, `n`, `timestamp`, `id`, `output`]
+
+    csv({ noheader: false, headers: column_headings }).fromFile(staging + file_to_test)
+        .then((data) => {
+            data.forEach(point => {
+                log(point.id + ',' + point.output)
+            })
+        })
+
+}
+
 // Parse generation data file
 
-parse_generation_data = (required_files, call_back) => {
+parse_generation_data = (required_files, sub_staging, call_back) => {
 
     var column_headings = [`i`, `d`, `u`, `n`, `timestamp`, `id`, `output`]
     var upload_array = []
     var parsed_files = 0
 
     async.map(required_files, (file, parse_complete) => {
-        csv({ file: staging + file, columns: column_headings }, (err, array) => {
-            if (err) {
-                console.log(err)
-                parse_complete(null)
-            } else {
-                var temp_data_array = []
-                array.forEach(point => {
-                    if (point.i == `D` && point.output != 0) {
-                        var already_exists = false
-                        for (row_1 = 0; row_1 < temp_data_array.length; row_1++) {
-                            if (temp_data_array[row_1].timestamp == point.timestamp && temp_data_array[row_1].id == point.id) {
-                                already_exists = true
-                            }
-                        }
-                        if (!already_exists) {
-                            temp_data_array.push({
-                                timestamp: point.timestamp,
-                                id: point.id,
-                                output: point.output
-                            })
-                            upload_array.push({
-                                timestamp: point.timestamp,
-                                id: point.id,
-                                output: point.output
-                            })
-
+        log(staging + sub_staging + file)
+        csv({ noheader: false, headers: column_headings }).fromFile(staging + sub_staging + file).then((data) => {
+            var temp_data_array = []
+            data.forEach(point => {
+                if (point.i == `D` && point.output != 0) {
+                    var already_exists = false
+                    for (row_1 = 0; row_1 < temp_data_array.length; row_1++) {
+                        if (temp_data_array[row_1].timestamp == point.timestamp && temp_data_array[row_1].id == point.id) {
+                            already_exists = true
                         }
                     }
-                })
+                    if (!already_exists) {
+                        temp_data_array.push({
+                            timestamp: point.timestamp,
+                            id: point.id,
+                            output: point.output
+                        })
+                        upload_array.push({
+                            timestamp: point.timestamp,
+                            id: point.id,
+                            output: point.output
+                        })
 
-                parsed_files += 1
-                process.stdout.clearLine()
-                process.stdout.cursorTo(0)
-                process.stdout.write(`${parsed_files} of ${required_files.length} files parsed...`)
-                parse_complete(null)
+                    }
+                }
+            })
 
-            }
+            parsed_files += 1
+            process.stdout.clearLine()
+            process.stdout.cursorTo(0)
+            process.stdout.write(`${parsed_files} of ${required_files.length} files parsed...`)
+            parse_complete(null)
+
         })
     }, () => {
 
@@ -551,8 +511,8 @@ parse_generation_data = (required_files, call_back) => {
 
 // Check if a file exists every wait_time and then proceed with success_call_back if it does
 
-wait_for_file = (file_name, success_call_back, error_call_back, current_attempt, attempts, wait_time) => {
-    fs.access(staging + file_name, (err) => {
+wait_for_file = (file_name, sub_staging, success_call_back, error_call_back, current_attempt, attempts, wait_time) => {
+    fs.access(staging + sub_staging, file_name, (err) => {
         if (err) {
             if (current_attempt < attempts) {
                 setTimeout(() => {
@@ -653,8 +613,45 @@ trim_url_to_file = file_name => {
             last_slash = char
         }
     }
-    file_name = file_name.substring(last_slash+1, file_name.length)
+    file_name = file_name.substring(last_slash + 1, file_name.length)
     return file_name
+}
+
+// Creates a temporary staging folder within the staging folder
+
+create_temp_staging = (current_stage_attempt, call_back) => {
+
+    var max_folder_attempts = 1000
+    var folder_name = current_stage_attempt
+
+    if (folder_name > max_folder_attempts) {
+        log(`Failed to create directory ${staging}${folder_name} ${err}`, 'e');
+        call_back(`error`)
+    } else {
+        fs.mkdir(staging + folder_name, (err) => {
+            if (err) {
+                folder_name += 1
+                create_temp_staging(folder_name, call_back)
+            } else {
+                call_back(folder_name + '/')
+            }
+        })
+    }
+
+}
+
+purge_sub_staging = (sub_staging, call_back) => {
+    fs.readdir(staging + sub_staging, (err, deleting_files) => {
+        if (err) {
+            log('There was some error deleting files from staging: ' + err, 'e')
+        } else {
+            for (file of deleting_files) {
+                fs.unlink(staging + sub_staging + file)
+            }
+            fs.rmdir(staging + sub_staging)
+            call_back()
+        }
+    })
 }
 
 // Small function for logging how long something takes, call console.timeEnd('-> time') first, then checkpoint() for each lap
